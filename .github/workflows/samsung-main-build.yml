@@ -6,7 +6,6 @@ name: Build Samsung Galaxy Z Fold6 (F956B) KernelSU
 # against the device's exact kernel build.
 #
 # Trigger: GitHub UI -> Actions -> "Build Samsung Galaxy Z Fold6 (F956B) KernelSU" -> Run workflow.
-
 on:
   workflow_dispatch:
     inputs:
