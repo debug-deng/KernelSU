@@ -64,10 +64,22 @@ jobs:
       - name: Force vermagic to target kernel release
         run: |
           set -e
-          echo "Overwriting utsrelease.h / kernel.release -> ${TARGET_UTSRELEASE}"
-          echo "${TARGET_UTSRELEASE}" > "$KDIR/include/generated/utsrelease.h"
+          echo "Overwriting UTS_RELEASE in utsrelease.h and kernel.release -> ${TARGET_UTSRELEASE}"
+          # utsrelease.h must keep its #define wrapper -- it's included as C source.
+          # Use sed to replace whatever UTS_RELEASE line exists, regardless of original
+          # single/multi-line format. This is the same line vermagic.h expands into the
+          # module's vermagic: tag.
+          sed -i 's|^#define UTS_RELEASE .*|#define UTS_RELEASE "'"${TARGET_UTSRELEASE}"'"|' \
+            "$KDIR/include/generated/utsrelease.h"
+          # If sed didn't match (e.g. file was empty), append the define.
+          if ! grep -q "UTS_RELEASE" "$KDIR/include/generated/utsrelease.h"; then
+            printf '%s\n' '#define UTS_RELEASE "'"${TARGET_UTSRELEASE}"'"' \
+              >> "$KDIR/include/generated/utsrelease.h"
+          fi
           echo "${TARGET_UTSRELEASE}" > "$KDIR/include/config/kernel.release"
+          echo "--- utsrelease.h ---"
           cat "$KDIR/include/generated/utsrelease.h"
+          echo "--- kernel.release ---"
           cat "$KDIR/include/config/kernel.release"
 
       - name: Build kernelsu.ko (out-of-tree via DDK)
