@@ -5,6 +5,12 @@ name: Build Samsung Galaxy Z Fold6 (F956B) KernelSU
 # Vermagic is forced to 6.1.145-android14-11-33418572-abF956BXXS4DZG3 so the .ko loads
 # against the device's exact kernel build.
 #
+# Two jobs:
+#   1. build-ko   - runs inside ghcr.io/ylarod/ddk-min image (provides clang + kernel tree).
+#   2. build-ksud - runs on plain ubuntu-latest (provides rustup + NDK r29).
+#
+# Final pack job merges both into one zip artifact.
+#
 # Trigger: GitHub UI -> Actions -> "Build Samsung Galaxy Z Fold6 (F956B) KernelSU" -> Run workflow.
 on:
   workflow_dispatch:
@@ -23,24 +29,24 @@ on:
 permissions:
   contents: read
 
+env:
+  KMI: android14-6.1
+  FIRMWARE: F956BXXS4DZG3
+  TARGET_UTSRELEASE: ${{ inputs.target_utsrelease }}
+  # Samsung toggles -- all required on 6.1 Samsung QSEE/KDP devices.
+  CONFIG_KSU: m
+  CONFIG_KSU_SAMSUNG_KDP: y
+  CONFIG_KSU_SAMSUNG_RKP: y
+  CONFIG_KSU_SAMSUNG_DEFEX: y
+  CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT: y
+
 jobs:
-  build-kernelsu:
-    name: Build kernelsu.ko + ksud
+  build-ko:
+    name: Build kernelsu.ko (DDK container)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/ylarod/ddk-min:android14-6.1-${{ inputs.ddk_release }}
+      image: ghcr.io/ylarod/ddk-min:${{ env.KMI }}-${{ inputs.ddk_release }}
       options: --privileged
-
-    env:
-      KMI: android14-6.1
-      FIRMWARE: F956BXXS4DZG3
-      TARGET_UTSRELEASE: ${{ inputs.target_utsrelease }}
-      # Samsung toggles -- all required on 6.1 Samsung QSEE/KDP devices.
-      CONFIG_KSU: m
-      CONFIG_KSU_SAMSUNG_KDP: y
-      CONFIG_KSU_SAMSUNG_RKP: y
-      CONFIG_KSU_SAMSUNG_DEFEX: y
-      CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT: y
 
     steps:
       - name: Checkout source
@@ -119,7 +125,7 @@ jobs:
           modinfo kernelsu.ko || true
           echo "=== vermagic check ==="
           VERMAGIC=$(modinfo -F vermagic kernelsu.ko)
-          echo "varmacig: ${VERMAGIC}"
+          echo "vermagic: ${VERMAGIC}"
           if ! echo "${VERMAGIC}" | grep -q "${TARGET_UTSRELEASE}"; then
             echo "ERROR: vermagic does not contain target uname -r (${TARGET_UTSRELEASE})"
             exit 1
@@ -132,13 +138,22 @@ jobs:
           llvm-strip -d kernelsu.ko
           ls -la kernelsu.ko
 
-      - name: Stage artifact directory
-        run: |
-          mkdir -p out
-          cp kernel/kernelsu.ko "out/kernelsu-${KMI}-${FIRMWARE}-samsung-main-no-patch-text-kdp.ko"
-          ls -la out/
+      - name: Upload kernelsu.ko artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernelsu-ko-${{ env.FIRMWARE }}
+          path: kernel/kernelsu.ko
 
-      - name: Setup rustup for ksud build
+  build-ksud:
+    name: Build ksud (ubuntu + NDK r29)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup rustup
         run: |
           rustup update stable
           rustup target add aarch64-linux-android
@@ -163,20 +178,56 @@ jobs:
 
       - name: Stage ksud
         run: |
+          mkdir -p out
           cp target/aarch64-linux-android/release/ksud \
             "out/ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp"
+          chmod +x "out/ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp"
           ls -la out/
 
-      - name: Pack zip
+      - name: Upload ksud artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-${{ env.FIRMWARE }}
+          path: out/ksud-zfold6-${{ env.FIRMWARE }}-samsung-main-no-patch-text-kdp
+
+  pack:
+    name: Pack and upload final zip
+    runs-on: ubuntu-latest
+    needs: [build-ko, build-ksud]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Download kernelsu.ko
+        uses: actions/download-artifact@v8
+        with:
+          name: kernelsu-ko-${{ env.FIRMWARE }}
+          path: parts/
+
+      - name: Download ksud
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-${{ env.FIRMWARE }}
+          path: parts/
+
+      - name: Assemble zip
         run: |
+          set -e
+          ls -la parts/
+          mkdir -p out
+          mv parts/kernelsu.ko \
+            "out/kernelsu-${KMI}-${FIRMWARE}-samsung-main-no-patch-text-kdp.ko"
+          mv parts/ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp \
+            "out/ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp"
           cd out
           zip -9 "kernelsu-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp.zip" \
             "kernelsu-${KMI}-${FIRMWARE}-samsung-main-no-patch-text-kdp.ko" \
             "ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp"
           ls -la
           sha256sum *.ko *.zip > SHA256SUMS
+          cat SHA256SUMS
 
-      - name: Upload artifact
+      - name: Upload final artifact
         uses: actions/upload-artifact@v7
         with:
           name: kernelsu-zfold6-${{ env.FIRMWARE }}-samsung-main-no-patch-text-kdp
