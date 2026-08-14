@@ -1,0 +1,171 @@
+name: Build Samsung Galaxy Z Fold6 (F956B) KernelSU
+
+# Build kernelsu.ko + ksud for SM-F956B on 6.1.145-android14-11
+# Targets the samsung-main branch with CONFIG_KSU_SAMSUNG_{KDP,RKP,DEFEX,NO_PATCH_TEXT}=y
+# Vermagic is forced to 6.1.145-android14-11-33418572-abF956BXXS4DZG3 so the .ko loads
+# against the device's exact kernel build.
+#
+# Trigger: GitHub UI -> Actions -> "Build Samsung Galaxy Z Fold6 (F956B) KernelSU" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ddk_release:
+        description: 'DDK release tag (e.g. 20260313)'
+        required: false
+        default: '20260313'
+        type: string
+      target_utsrelease:
+        description: 'Target uname -r string (forced into utsrelease.h)'
+        required: false
+        default: '6.1.145-android14-11-33418572-abF956BXXS4DZG3'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-kernelsu:
+    name: Build kernelsu.ko + ksud
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:android14-6.1-${{ inputs.ddk_release }}
+      options: --privileged
+
+    env:
+      KMI: android14-6.1
+      FIRMWARE: F956BXXS4DZG3
+      TARGET_UTSRELEASE: ${{ inputs.target_utsrelease }}
+      # Samsung toggles -- all required on 6.1 Samsung QSEE/KDP devices.
+      CONFIG_KSU: m
+      CONFIG_KSU_SAMSUNG_KDP: y
+      CONFIG_KSU_SAMSUNG_RKP: y
+      CONFIG_KSU_SAMSUNG_DEFEX: y
+      CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT: y
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Allow git in container
+        run: git config --global --add safe.directory /__w/KernelSU/KernelSU
+
+      - name: Verify DDK kernel tree is present
+        run: |
+          echo "KDIR=${KDIR:-/usr/src/kernel}"
+          ls "$KDIR" | head -20
+          test -f "$KDIR/include/generated/utsrelease.h" || {
+            echo "ERROR: utsrelease.h not found at $KDIR/include/generated/utsrelease.h"
+            echo "DDK image may be wrong or KDIR env var is unset."
+            exit 1
+          }
+
+      - name: Force vermagic to target kernel release
+        run: |
+          set -e
+          echo "Overwriting utsrelease.h / kernel.release -> ${TARGET_UTSRELEASE}"
+          echo "${TARGET_UTSRELEASE}" > "$KDIR/include/generated/utsrelease.h"
+          echo "${TARGET_UTSRELEASE}" > "$KDIR/include/config/kernel.release"
+          cat "$KDIR/include/generated/utsrelease.h"
+          cat "$KDIR/include/config/kernel.release"
+
+      - name: Build kernelsu.ko (out-of-tree via DDK)
+        working-directory: kernel
+        run: |
+          set -e
+          echo "=== Building kernelsu.ko ==="
+          echo "CONFIG_KSU=${CONFIG_KSU}"
+          echo "CONFIG_KSU_SAMSUNG_KDP=${CONFIG_KSU_SAMSUNG_KDP}"
+          echo "CONFIG_KSU_SAMSUNG_RKP=${CONFIG_KSU_SAMSUNG_RKP}"
+          echo "CONFIG_KSU_SAMSUNG_DEFEX=${CONFIG_KSU_SAMSUNG_DEFEX}"
+          echo "CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=${CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT}"
+
+          # Pass toggles as make variables so they reach Kbuild's $(CONFIG_KSU_SAMSUNG_*) tests.
+          make clean
+          make -j"$(nproc)" \
+            CONFIG_KSU="${CONFIG_KSU}" \
+            CONFIG_KSU_SAMSUNG_KDP="${CONFIG_KSU_SAMSUNG_KDP}" \
+            CONFIG_KSU_SAMSUNG_RKP="${CONFIG_KSU_SAMSUNG_RKP}" \
+            CONFIG_KSU_SAMSUNG_DEFEX="${CONFIG_KSU_SAMSUNG_DEFEX}" \
+            CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT="${CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT}" \
+            CC=clang \
+            KBUILD_MODPOST_WARN=1
+
+          echo "=== Build complete ==="
+          ls -la kernelsu.ko
+
+      - name: Inspect kernelsu.ko
+        working-directory: kernel
+        run: |
+          echo "=== modinfo ==="
+          modinfo kernelsu.ko || true
+          echo "=== vermagic check ==="
+          VERMAGIC=$(modinfo -F vermagic kernelsu.ko)
+          echo "varmacig: ${VERMAGIC}"
+          if ! echo "${VERMAGIC}" | grep -q "${TARGET_UTSRELEASE}"; then
+            echo "ERROR: vermagic does not contain target uname -r (${TARGET_UTSRELEASE})"
+            exit 1
+          fi
+          echo "vermagic matches target."
+
+      - name: Strip kernelsu.ko
+        working-directory: kernel
+        run: |
+          llvm-strip -d kernelsu.ko
+          ls -la kernelsu.ko
+
+      - name: Stage artifact directory
+        run: |
+          mkdir -p out
+          cp kernel/kernelsu.ko "out/kernelsu-${KMI}-${FIRMWARE}-samsung-main-no-patch-text-kdp.ko"
+          ls -la out/
+
+      - name: Setup rustup for ksud build
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: userspace/ksud
+          cache-targets: false
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+
+      - name: Stage ksud
+        run: |
+          cp target/aarch64-linux-android/release/ksud \
+            "out/ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp"
+          ls -la out/
+
+      - name: Pack zip
+        run: |
+          cd out
+          zip -9 "kernelsu-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp.zip" \
+            "kernelsu-${KMI}-${FIRMWARE}-samsung-main-no-patch-text-kdp.ko" \
+            "ksud-zfold6-${FIRMWARE}-samsung-main-no-patch-text-kdp"
+          ls -la
+          sha256sum *.ko *.zip > SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernelsu-zfold6-${{ env.FIRMWARE }}-samsung-main-no-patch-text-kdp
+          path: |
+            out/kernelsu-zfold6-${{ env.FIRMWARE }}-samsung-main-no-patch-text-kdp.zip
+            out/kernelsu-${{ env.KMI }}-${{ env.FIRMWARE }}-samsung-main-no-patch-text-kdp.ko
+            out/ksud-zfold6-${{ env.FIRMWARE }}-samsung-main-no-patch-text-kdp
+            out/SHA256SUMS
