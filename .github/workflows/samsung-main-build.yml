@@ -25,6 +25,9 @@ on:
         required: false
         default: '6.1.145-android14-11-33418572-abF956BXXS4DZG3'
         type: string
+  push:
+    branches:
+      - samsung-main
 
 permissions:
   contents: read
