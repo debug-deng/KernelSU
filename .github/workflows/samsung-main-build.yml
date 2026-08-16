@@ -147,6 +147,7 @@ jobs:
   build-ksud:
     name: Build ksud (ubuntu + NDK r29)
     runs-on: ubuntu-latest
+    needs: build-ko
     steps:
       - name: Checkout source
         uses: actions/checkout@v7
@@ -167,6 +168,19 @@ jobs:
         id: setup-ndk
         with:
           ndk-version: r29
+
+      - name: Download F956B kernelsu.ko
+        uses: actions/download-artifact@v8
+        with:
+          name: kernelsu-ko-${{ env.FIRMWARE }}
+          path: kernel-artifact/
+
+      - name: Embed F956B kernelsu.ko into ksud
+        run: |
+          set -euo pipefail
+          install -D -m 0644 kernel-artifact/kernelsu.ko \
+            userspace/ksud/bin/aarch64/android14-6.1_kernelsu.ko
+          ls -l userspace/ksud/bin/aarch64/android14-6.1_kernelsu.ko
 
       - name: Build ksud
         env:
