@@ -35,7 +35,7 @@ permissions:
 env:
   KMI: android14-6.1
   FIRMWARE: F956BXXS4DZG3
-  TARGET_UTSRELEASE: ${{ inputs.target_utsrelease }}
+  TARGET_UTSRELEASE: ${{ inputs.target_utsrelease || '6.1.145-android14-11-33418572-abF956BXXS4DZG3' }}
   # Samsung toggles -- all required on 6.1 Samsung QSEE/KDP devices.
   CONFIG_KSU: m
   CONFIG_KSU_SAMSUNG_KDP: y
@@ -47,9 +47,8 @@ jobs:
   build-ko:
     name: Build kernelsu.ko (DDK container)
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/ylarod/ddk-min:android14-6.1-${{ inputs.ddk_release }}
-      options: --privileged
+    env:
+      DDK_IMAGE: ghcr.io/ylarod/ddk-min:android14-6.1-${{ inputs.ddk_release || '20260313' }}
 
     steps:
       - name: Checkout source
@@ -57,89 +56,54 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Allow git in container
-        run: git config --global --add safe.directory /__w/KernelSU/KernelSU
-
-      - name: Verify DDK kernel tree is present
+      - name: Pull DDK image with retries
         run: |
-          echo "KDIR=${KDIR:-/usr/src/kernel}"
-          ls "$KDIR" | head -20
-          test -f "$KDIR/include/generated/utsrelease.h" || {
-            echo "ERROR: utsrelease.h not found at $KDIR/include/generated/utsrelease.h"
-            echo "DDK image may be wrong or KDIR env var is unset."
-            exit 1
-          }
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            echo "Pull attempt ${attempt}/5: ${DDK_IMAGE}"
+            if docker pull "${DDK_IMAGE}"; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Unable to pull DDK image after 5 attempts"
+          exit 1
 
-      - name: Force vermagic to target kernel release
+      - name: Build kernelsu.ko in DDK container
         run: |
-          set -e
-          echo "Overwriting UTS_RELEASE in utsrelease.h and kernel.release -> ${TARGET_UTSRELEASE}"
-          # utsrelease.h must keep its #define wrapper -- it's included as C source.
-          # Use sed to replace whatever UTS_RELEASE line exists, regardless of original
-          # single/multi-line format. This is the same line vermagic.h expands into the
-          # module's vermagic: tag.
-          sed -i 's|^#define UTS_RELEASE .*|#define UTS_RELEASE "'"${TARGET_UTSRELEASE}"'"|' \
-            "$KDIR/include/generated/utsrelease.h"
-          # If sed didn't match (e.g. file was empty), append the define.
-          if ! grep -q "UTS_RELEASE" "$KDIR/include/generated/utsrelease.h"; then
-            printf '%s\n' '#define UTS_RELEASE "'"${TARGET_UTSRELEASE}"'"' \
-              >> "$KDIR/include/generated/utsrelease.h"
-          fi
-          echo "${TARGET_UTSRELEASE}" > "$KDIR/include/config/kernel.release"
-          echo "--- utsrelease.h ---"
-          cat "$KDIR/include/generated/utsrelease.h"
-          echo "--- kernel.release ---"
-          cat "$KDIR/include/config/kernel.release"
-
-      - name: Build kernelsu.ko (out-of-tree via DDK)
-        working-directory: kernel
-        run: |
-          set -e
-          echo "=== Building kernelsu.ko ==="
-          echo "KDIR=${KDIR}"
-          echo "CONFIG_KSU=${CONFIG_KSU}"
-          echo "CONFIG_KSU_SAMSUNG_KDP=${CONFIG_KSU_SAMSUNG_KDP}"
-          echo "CONFIG_KSU_SAMSUNG_RKP=${CONFIG_KSU_SAMSUNG_RKP}"
-          echo "CONFIG_KSU_SAMSUNG_DEFEX=${CONFIG_KSU_SAMSUNG_DEFEX}"
-          echo "CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=${CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT}"
-
-          # Build modules directly via $(KDIR) Makefile, bypassing the KSU wrapper Makefile's
-          # post-build `./check_symbol kernelsu.ko $KDIR/vmlinux` step. That step would compare
-          # the .ko's symbol CRCs against the DDK image's vmlinux, which has different
-          # modversions CRCs than the device kernel -- the real verification is `insmod` on
-          # the device, not the CRC match.
-          ODIR="$(pwd)"
-          make -C "${KDIR}" M="${ODIR}" src="${ODIR}" modules -j"$(nproc)" \
-            CONFIG_KSU="${CONFIG_KSU}" \
-            CONFIG_KSU_SAMSUNG_KDP="${CONFIG_KSU_SAMSUNG_KDP}" \
-            CONFIG_KSU_SAMSUNG_RKP="${CONFIG_KSU_SAMSUNG_RKP}" \
-            CONFIG_KSU_SAMSUNG_DEFEX="${CONFIG_KSU_SAMSUNG_DEFEX}" \
-            CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT="${CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT}" \
-            CC=clang \
-            KBUILD_MODPOST_WARN=1
-
-          echo "=== Build complete ==="
-          ls -la kernelsu.ko
-
-      - name: Inspect kernelsu.ko
-        working-directory: kernel
-        run: |
-          echo "=== modinfo ==="
-          modinfo kernelsu.ko || true
-          echo "=== vermagic check ==="
-          VERMAGIC=$(modinfo -F vermagic kernelsu.ko)
-          echo "vermagic: ${VERMAGIC}"
-          if ! echo "${VERMAGIC}" | grep -q "${TARGET_UTSRELEASE}"; then
-            echo "ERROR: vermagic does not contain target uname -r (${TARGET_UTSRELEASE})"
-            exit 1
-          fi
-          echo "vermagic matches target."
-
-      - name: Strip kernelsu.ko
-        working-directory: kernel
-        run: |
-          llvm-strip -d kernelsu.ko
-          ls -la kernelsu.ko
+          set -euo pipefail
+          docker run --rm --privileged \
+            -e TARGET_UTSRELEASE="${TARGET_UTSRELEASE}" \
+            -e CONFIG_KSU="${CONFIG_KSU}" \
+            -e CONFIG_KSU_SAMSUNG_KDP="${CONFIG_KSU_SAMSUNG_KDP}" \
+            -e CONFIG_KSU_SAMSUNG_RKP="${CONFIG_KSU_SAMSUNG_RKP}" \
+            -e CONFIG_KSU_SAMSUNG_DEFEX="${CONFIG_KSU_SAMSUNG_DEFEX}" \
+            -e CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT="${CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT}" \
+            -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace/kernel \
+            "${DDK_IMAGE}" bash -lc '
+              set -euo pipefail
+              KDIR="${KDIR:-/usr/src/kernel}"
+              echo "KDIR=${KDIR}"
+              test -f "${KDIR}/include/generated/utsrelease.h"
+              sed -i "s|^#define UTS_RELEASE .*|#define UTS_RELEASE \"${TARGET_UTSRELEASE}\"|" \
+                "${KDIR}/include/generated/utsrelease.h"
+              grep -q UTS_RELEASE "${KDIR}/include/generated/utsrelease.h" || \
+                printf "%s\\n" "#define UTS_RELEASE \"${TARGET_UTSRELEASE}\"" >> "${KDIR}/include/generated/utsrelease.h"
+              echo "${TARGET_UTSRELEASE}" > "${KDIR}/include/config/kernel.release"
+              make -C "${KDIR}" M="${PWD}" src="${PWD}" modules -j"$(nproc)" \
+                CONFIG_KSU="${CONFIG_KSU}" \
+                CONFIG_KSU_SAMSUNG_KDP="${CONFIG_KSU_SAMSUNG_KDP}" \
+                CONFIG_KSU_SAMSUNG_RKP="${CONFIG_KSU_SAMSUNG_RKP}" \
+                CONFIG_KSU_SAMSUNG_DEFEX="${CONFIG_KSU_SAMSUNG_DEFEX}" \
+                CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT="${CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT}" \
+                CC=clang KBUILD_MODPOST_WARN=1
+              modinfo kernelsu.ko || true
+              VERMAGIC=$(modinfo -F vermagic kernelsu.ko)
+              echo "vermagic: ${VERMAGIC}"
+              echo "${VERMAGIC}" | grep -q "${TARGET_UTSRELEASE}"
+              llvm-strip -d kernelsu.ko
+              ls -la kernelsu.ko
+            '
 
       - name: Upload kernelsu.ko artifact
         uses: actions/upload-artifact@v7
